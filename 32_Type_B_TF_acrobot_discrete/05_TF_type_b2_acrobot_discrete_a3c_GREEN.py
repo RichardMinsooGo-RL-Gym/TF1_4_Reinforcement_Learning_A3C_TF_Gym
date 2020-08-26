@@ -1,10 +1,14 @@
-import os
-import sys
 import gym
-import pylab
-import numpy as np
-import time
 import tensorflow as tf
+import numpy as np
+import time, datetime
+import sys
+import pickle
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+from tensorflow.python.framework import ops
+ops.reset_default_graph()
+
 import multiprocessing
 import threading
 # N_WORKERS = multiprocessing.cpu_count()
@@ -17,43 +21,45 @@ env = gym.make(env_name)
 # tf.set_random_seed(456)  # reproducible
 env = env.unwrapped
 
-
 # get size of state and action from environment
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-MAX_EP_STEP = 3000
+training_time = 5*60
+ep_trial_step = 10000
 UPDATE_GLOBAL_ITER = 10
 discount_factor = 0.9  # reward discount
-ENTROPY_BETA = 0.001
+# ENTROPY_BETA = 0.001
 
-model_lr = 0.001    # learning rate for actor
-critic_lr = 0.001    # learning rate for critic
+learning_rate = 0.005
 
 episode = 0
+step = 0
 
-model_path = os.path.join(os.getcwd(), 'save_model')
-graph_path = os.path.join(os.getcwd(), 'save_graph')
+game_name =  sys.argv[0][:-3]
 
-if not os.path.isdir(model_path):
-    os.mkdir(model_path)
+model_path = "save_model/" + game_name
+graph_path = "save_graph/" + game_name
 
-if not os.path.isdir(graph_path):
-    os.mkdir(graph_path)
+# Make folder for save data
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+if not os.path.exists(graph_path):
+    os.makedirs(graph_path)
 
 # Network for the Actor Critic
 class A3CAgent(object):
     def __init__(self, scope, master_agent = None):
         
+        # if you want to see Cartpole learning, then change to True
+        self.render = False
         # get size of state and action
-        self.action_size = action_size
         self.state_size = state_size
+        self.action_size = action_size
         self.value_size = 1
         
         # these is hyper parameters for the ActorCritic
-        self.discount_factor = 0.99         # decay rate
-        
-        self.hidden1, self.hidden2 = 128, 128
+        self.hidden1, self.hidden2 = 64, 64
         
         self.master_agent = master_agent
         self.scope = scope
@@ -84,7 +90,7 @@ class A3CAgent(object):
                 exp_v = log_prob * tf.stop_gradient(self.td_error)
                 entropy = -tf.reduce_sum(self.policy * tf.log(self.policy + 1e-5),
                                          axis=1, keep_dims=True)  # encourage exploration
-                self.exp_v = ENTROPY_BETA * entropy + exp_v
+                self.exp_v = 0.001 * entropy + exp_v
                 self.actor_loss = tf.reduce_mean(-self.exp_v)
                 self.loss_total = self.actor_loss + self.critic_loss
 
@@ -114,9 +120,8 @@ class A3CAgent(object):
                                                    bias_initializer=b_init)
 
             self.policy = tf.nn.softmax(self.actor_predict)
-            
+    
         # with tf.variable_scope("critic"):
-            
             critic_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
                 kernel_initializer=w_init, bias_initializer=b_init, name='fc1_c')
 
@@ -136,14 +141,6 @@ class A3CAgent(object):
 
     # get action from policy network
     def get_action(self, state):
-        """
-            Choose action based on observation
-
-            Arguments:
-                state: array of state, has shape (num_features)
-
-            Returns: index of action we want to choose
-        """ 
         # Reshape observation to (num_features, 1)
         state_t =  state[np.newaxis, :]
         # Run forward propagation to get softmax probabilities
@@ -160,7 +157,6 @@ class Worker(object):
         self.coordinator = COORD
         self.name = name
         self.agent = A3CAgent(name, master_agent)
-        
         self.master_agent = master_agent
 
         self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
@@ -200,30 +196,35 @@ class Worker(object):
         self.buffer_q_target = []
 
     def work(self):
-        global episode
-        train_steps = 0
+        global episode, step
+        
+        avg_score = 10000
+        episodes, scores = [], []
+
         self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
         
-        scores, episodes = [], []
-        avg_score = MAX_EP_STEP
-
+        # Step 3.2: run the game
+        display_time = datetime.datetime.now()
+        print("\n\n",game_name, "-game start at :",display_time,"\n")
         start_time = time.time()
         
-        while time.time() - start_time < 5 * 60 and avg_score > 90:
+        while time.time() - start_time < training_time and avg_score > 90:
             
-            done = False
-            score = 0
             state = self.env.reset()
 
-            while not done and score < MAX_EP_STEP:
+            done = False
+            score = 10000
+            ep_step = 0
+
+            while not done and ep_step < ep_trial_step:
                 # every time step we do train from the replay memory
-                score += 1
+                ep_step += 1
+                step += 1
                 
                 # if self.name == 'W_0':
                 #     self.env.render()
                 
-                train_steps += 1
-                # get action for the current state and go one step in environment
+                # Select action_arr
                 action = self.agent.get_action(state)
                 
                 # make step in environment
@@ -232,14 +233,15 @@ class Worker(object):
                 # save the sample <state, action, reward> to the memory
                 self.append_sample(state, action, reward)
                 
-                if train_steps % 10 == 0 or done:   # update global and assign to local net
+                if step % 10 == 0 or done:   # update global and assign to local net
                     self.train_model(next_state, done)
                     
-                # swap observation
+                score = ep_step
+
                 state = next_state
                 
                 # train when epsisode finished
-                if done or score == MAX_EP_STEP:
+                if done or ep_step == ep_trial_step:
                     episode += 1
                     # self.train_model(next_state, done)
                     
@@ -247,18 +249,19 @@ class Worker(object):
                     scores.append(score)
                     episodes.append(episode)
                     avg_score = np.mean(scores[-min(30, len(scores)):])
-                    
-                    print("episode :{:5d}".format(episode), "/ score :{:5d}".format(score))
-                    
+
+                    print('episode :{:>6,d}'.format(episode),'/ ep step :{:>5,d}'.format(ep_step), \
+                          '/ time step :{:>8,d}'.format(step),'/ last 30 avg :{:> 4.1f}'.format(avg_score) )
+
                     break
 
         e = int(time.time() - start_time)
-        print('Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
+        print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
 
 if __name__ == "__main__":
     sess = tf.Session()
 
-    OPT_A = tf.train.RMSPropOptimizer(model_lr, name='RMSPropA')
+    OPT_A = tf.train.RMSPropOptimizer(learning_rate, name='RMSPropA')
     global_agent = A3CAgent("master")  # we only need its params
     workers = []
     
