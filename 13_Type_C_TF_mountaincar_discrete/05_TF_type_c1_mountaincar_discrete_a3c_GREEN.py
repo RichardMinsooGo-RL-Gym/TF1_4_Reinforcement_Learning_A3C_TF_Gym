@@ -1,10 +1,14 @@
-import os
-import sys
 import gym
-import pylab
-import numpy as np
-import time
 import tensorflow as tf
+import numpy as np
+import time, datetime
+import sys
+import pickle
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+from tensorflow.python.framework import ops
+ops.reset_default_graph()
+
 import multiprocessing
 import threading
 # N_WORKERS = multiprocessing.cpu_count()
@@ -20,35 +24,42 @@ env = gym.make(env_name)
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-MAX_EP_STEP = 15000
+training_time = 40*60
+ep_trial_step = 10000
+
 UPDATE_GLOBAL_ITER = 10
 discount_factor = 0.9  # reward discount
-ENTROPY_BETA = 0.001
+# ENTROPY_BETA = 0.001
 
-actor_lr = 0.001    # learning rate for actor
-critic_lr = 0.001    # learning rate for critic
+learning_rate = 0.005
 
 episode = 0
+step = 0
 
-model_path = os.path.join(os.getcwd(), 'save_model')
-graph_path = os.path.join(os.getcwd(), 'save_graph')
+game_name =  sys.argv[0][:-3]
 
-if not os.path.isdir(model_path):
-    os.mkdir(model_path)
+model_path = "save_model/" + game_name
+graph_path = "save_graph/" + game_name
 
-if not os.path.isdir(graph_path):
-    os.mkdir(graph_path)
+# Make folder for save data
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+if not os.path.exists(graph_path):
+    os.makedirs(graph_path)
 
 # Network for the Actor Critic
 class A3CAgent(object):
     def __init__(self, sess, scope, master_agent = None):
         self.sess = sess
+        # if you want to see Cartpole learning, then change to True
+        self.render = False
         # get size of state and action
-        self.action_size = action_size
         self.state_size = state_size
+        self.action_size = action_size
         self.value_size = 1
         
-        self.hidden1, self.hidden2 = 128, 128
+        # these is hyper parameters for the ActorCritic
+        self.hidden1, self.hidden2 = 64, 64
         
         self.master_agent = master_agent
         self.scope = scope
@@ -64,47 +75,6 @@ class A3CAgent(object):
         self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
         self.action = tf.placeholder(tf.int32,   [None, ],               name='action')
         self.q_target = tf.placeholder(tf.float32, [None, 1],          name='q_target')
-
-    # make loss function for Policy Gradient
-    # [log(action probability) * discounted_rewards] will be input for the back prop
-    # we add entropy of action probability to loss
-    def _init_op(self):
-        if self.scope == 'master':   # get global network
-            with tf.name_scope(self.scope):
-                self.actor_optimizer = tf.train.RMSPropOptimizer(actor_lr)
-                self.critic_optimizer = tf.train.RMSPropOptimizer(critic_lr)
-        else:   # local net, calculate losses
-            with tf.variable_scope(self.scope):
-                # with tf.variable_scope('td_error'):
-                self.td_error = tf.subtract(self.q_target, self.value, name='td_error')
-
-                # with tf.variable_scope('critic_loss'):
-                self.critic_loss = tf.reduce_mean(tf.square(self.td_error))
-
-                # with tf.variable_scope('actor_loss'):
-                log_prob = tf.reduce_sum(tf.log(self.policy + 1e-5) * tf.one_hot(self.action, self.action_size, dtype=tf.float32), axis=1, keep_dims=True)
-                exp_v = log_prob * tf.stop_gradient(self.td_error)
-                entropy = -tf.reduce_sum(self.policy * tf.log(self.policy + 1e-5),
-                                         axis=1, keep_dims=True)  # encourage exploration
-                self.exp_v = ENTROPY_BETA * entropy + exp_v
-                self.actor_loss = tf.reduce_mean(-self.exp_v)
-
-                # with tf.name_scope('local_gradients'):
-                self.actor_gradients = tf.gradients(self.actor_loss, self.actor_params) #calculate gradients for the network weights
-                self.critic_gradients = tf.gradients(self.critic_loss, self.critic_params)
-
-            # with tf.name_scope('sync'): # update local and global network weights
-            # with tf.name_scope('pull'):
-            zipped_actor_vars = zip(self.actor_params, self.master_agent.actor_params)
-            zipped_critic_vars = zip(self.critic_params, self.master_agent.critic_params)
-            self.pull_actor_params_op = [l_a_p.assign(g_a_p) for l_a_p, g_a_p in zipped_actor_vars]
-            self.pull_critic_params_op = [l_c_p.assign(g_c_p) for l_c_p, g_c_p in zipped_critic_vars]
-
-            # with tf.name_scope('push'):
-            zipped_actor_vars = zip(self.actor_gradients, self.master_agent.actor_params)
-            zipped_critic_vars = zip(self.critic_gradients, self.master_agent.critic_params)
-            self.update_actor_op = self.master_agent.actor_optimizer.apply_gradients(zipped_actor_vars)
-            self.update_critic_op = self.master_agent.critic_optimizer.apply_gradients(zipped_critic_vars)
 
     # neural network structure of the actor and critic
     def build_model(self):
@@ -133,6 +103,47 @@ class A3CAgent(object):
         self.actor_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/actor')
         self.critic_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/critic')
 
+    # make loss function for Policy Gradient
+    # [log(action probability) * discounted_rewards] will be input for the back prop
+    # we add entropy of action probability to loss
+    def _init_op(self):
+        if self.scope == 'master':   # get global network
+            with tf.name_scope(self.scope):
+                self.actor_optimizer = tf.train.RMSPropOptimizer(learning_rate)
+                self.critic_optimizer = tf.train.RMSPropOptimizer(learning_rate)
+        else:   # local net, calculate losses
+            with tf.variable_scope(self.scope):
+                # with tf.variable_scope('td_error'):
+                self.td_error = tf.subtract(self.q_target, self.value, name='td_error')
+
+                # with tf.variable_scope('critic_loss'):
+                self.critic_loss = tf.reduce_mean(tf.square(self.td_error))
+
+                # with tf.variable_scope('actor_loss'):
+                log_prob = tf.reduce_sum(tf.log(self.policy + 1e-5) * tf.one_hot(self.action, self.action_size, dtype=tf.float32), axis=1, keep_dims=True)
+                exp_v = log_prob * tf.stop_gradient(self.td_error)
+                entropy = -tf.reduce_sum(self.policy * tf.log(self.policy + 1e-5),
+                                         axis=1, keep_dims=True)  # encourage exploration
+                self.exp_v = 0.001 * entropy + exp_v
+                self.actor_loss = tf.reduce_mean(-self.exp_v)
+
+                # with tf.name_scope('local_gradients'):
+                self.actor_gradients = tf.gradients(self.actor_loss, self.actor_params) #calculate gradients for the network weights
+                self.critic_gradients = tf.gradients(self.critic_loss, self.critic_params)
+
+            # with tf.name_scope('sync'): # update local and global network weights
+            # with tf.name_scope('pull'):
+            zipped_actor_vars = zip(self.actor_params, self.master_agent.actor_params)
+            zipped_critic_vars = zip(self.critic_params, self.master_agent.critic_params)
+            self.pull_actor_params_op = [l_a_p.assign(g_a_p) for l_a_p, g_a_p in zipped_actor_vars]
+            self.pull_critic_params_op = [l_c_p.assign(g_c_p) for l_c_p, g_c_p in zipped_critic_vars]
+
+            # with tf.name_scope('push'):
+            zipped_actor_vars = zip(self.actor_gradients, self.master_agent.actor_params)
+            zipped_critic_vars = zip(self.critic_gradients, self.master_agent.critic_params)
+            self.update_actor_op = self.master_agent.actor_optimizer.apply_gradients(zipped_actor_vars)
+            self.update_critic_op = self.master_agent.critic_optimizer.apply_gradients(zipped_critic_vars)
+
     def update_global(self, feed_dict):  # run by a local
         self.sess.run([self.update_actor_op, self.update_critic_op], feed_dict)
 
@@ -141,14 +152,6 @@ class A3CAgent(object):
 
     # get action from policy network
     def get_action(self, state):
-        """
-            Choose action based on observation
-
-            Arguments:
-                state: array of state, has shape (num_features)
-
-            Returns: index of action we want to choose
-        """ 
         # Reshape observation to (num_features, 1)
         state_t =  state[np.newaxis, :]
         # Run forward propagation to get softmax probabilities
@@ -206,30 +209,35 @@ class Worker(object):
         self.buffer_q_target = []
 
     def work(self):
-        global episode
-        train_steps = 0
+        global episode, step
+        
+        avg_score = 10000
+        episodes, scores = [], []
+
         self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
         
-        scores, episodes = [], []
-        avg_score = MAX_EP_STEP
-
+        # Step 3.2: run the game
+        display_time = datetime.datetime.now()
+        print("\n\n",game_name, "-game start at :",display_time,"\n")
         start_time = time.time()
         
-        while time.time() - start_time < 20*60 and avg_score > 200:
+        while time.time() - start_time < training_time and avg_score > 200:
             
-            done = False
-            score = 0
             state = self.env.reset()
 
-            while not done and score < MAX_EP_STEP:
+            done = False
+            score = 10000
+            ep_step = 0
+
+            while not done and ep_step < ep_trial_step:
                 # every time step we do train from the replay memory
-                score += 1
+                ep_step += 1
+                step += 1
                 
                 # if self.name == 'W_0':
                 #     self.env.render()
                 
-                train_steps += 1
-                # get action for the current state and go one step in environment
+                # Select action_arr
                 action = self.agent.get_action(state)
                 
                 # make step in environment
@@ -238,14 +246,15 @@ class Worker(object):
                 # save the sample <state, action, reward> to the memory
                 self.append_sample(state, action, reward)
                 
-                if train_steps % 10 == 0 or done:   # update global and assign to local net
+                if step % 10 == 0 or done:   # update global and assign to local net
                     self.train_model(next_state, done)
                     
-                # swap observation
+                score = ep_step
+
                 state = next_state
                 
                 # train when epsisode finished
-                if done or score == MAX_EP_STEP:
+                if done or ep_step == ep_trial_step:
                     episode += 1
                     # self.train_model(next_state, done)
                     
@@ -253,13 +262,14 @@ class Worker(object):
                     scores.append(score)
                     episodes.append(episode)
                     avg_score = np.mean(scores[-min(30, len(scores)):])
-                    
-                    print("episode :{:5d}".format(episode), "/ score :{:5d}".format(score))
-                    
+
+                    print('episode :{:>6,d}'.format(episode),'/ ep step :{:>5,d}'.format(ep_step), \
+                          '/ time step :{:>8,d}'.format(step),'/ last 30 avg :{:> 4.1f}'.format(avg_score) )
+
                     break
 
         e = int(time.time() - start_time)
-        print('Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
+        print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
 
 if __name__ == "__main__":
     sess = tf.Session()
@@ -290,4 +300,3 @@ if __name__ == "__main__":
     saver = tf.train.Saver()
     saver.save(sess, model_path+ "/")
     
-

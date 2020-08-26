@@ -69,12 +69,11 @@ class A2C_agent(object):
         self.action = tf.placeholder(tf.int32,   [None, ],               name='action')
         self.q_target = tf.placeholder(tf.float32, name="q_target")
 
-    # approximate policy and value using Neural Network
-    # actor -> state is input and probability of each action is output of network
+    # neural network structure of the actor and critic
     def build_model(self):
 
         w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(0.1)
-
+        
         with tf.variable_scope("actor"):
 
             actor_hidden = tf.layers.dense(self.state, self.hidden1, tf.nn.tanh, kernel_initializer=w_init,
@@ -94,8 +93,10 @@ class A2C_agent(object):
                 kernel_initializer=w_init, bias_initializer=b_init, name='fc2_c')
             self.value = critic_predict
             
+        self.actor_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/actor')
+        self.critic_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/critic')
+                
     def _init_op(self):
-        
         # with tf.variable_scope('td_error'):
         # A_t = R_t - V(S_t)
         # self.td_error = tf.subtract(self.q_target, self.value, name='td_error')
@@ -107,18 +108,23 @@ class A2C_agent(object):
         self.critic_loss = tf.reduce_mean(tf.square(self.value - self.q_target), axis=1)
 
         # with tf.variable_scope('actor_loss'):
-        log_prob = tf.reduce_sum(tf.log(self.policy + 1e-5) * tf.one_hot(self.action, self.action_size, dtype=tf.float32), axis=1, keep_dims=True)
-        exp_v = log_prob * tf.stop_gradient(self.td_error)
-        entropy = -tf.reduce_sum(self.policy * tf.log(self.policy + 1e-5),
-                                 axis=1, keep_dims=True)  # encourage exploration
-        self.exp_v = 0.001 * entropy + exp_v
-        self.actor_loss = tf.reduce_mean(-self.exp_v)
+        action_one_hot = tf.one_hot(self.action, self.action_size, dtype=tf.float32)
+        entropy = -tf.reduce_sum(tf.log(self.policy) * action_one_hot, axis=1, keep_dims=True)
         
-        self.loss_total = self.actor_loss + self.critic_loss
-
+        self.actor_loss = tf.reduce_mean(entropy * tf.stop_gradient(self.td_error))
+        
         # with tf.variable_scope('train'):
-        self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.loss_total)
+        self.actor_gradients = tf.gradients(self.actor_loss, self.actor_params) #calculate gradients for the network weights
+        self.critic_gradients = tf.gradients(self.critic_loss, self.critic_params)
+
+        self.actor_optimizer = tf.train.RMSPropOptimizer(self.learning_rate)
+        self.critic_optimizer = tf.train.RMSPropOptimizer(self.learning_rate)
         
+        zipped_actor_vars = zip(self.actor_gradients, self.actor_params)
+        zipped_critic_vars = zip(self.critic_gradients, self.critic_params)
+        self.update_actor_op = self.actor_optimizer.apply_gradients(zipped_actor_vars)
+        self.update_critic_op = self.critic_optimizer.apply_gradients(zipped_critic_vars)
+
     # get action from policy network
     def get_action(self, state):
         # Reshape observation to (num_features, 1)
@@ -156,7 +162,7 @@ class A2C_agent(object):
             self.q_target: np.vstack(self.buffer_q_target)
         } 
         
-        self.sess.run(self.train_op, feed_dict)
+        self.sess.run([self.update_actor_op, self.update_critic_op], feed_dict)
         
         self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
         self.buffer_q_target = []
@@ -249,7 +255,7 @@ def main():
         agent.save_model()
 
         pylab.plot(episodes, scores, 'b')
-        pylab.savefig("./save_graph/mountaincar_A2C_1.png")
+        pylab.savefig("./save_graph/mountaincar_A2C_8.png")
 
         e = int(time.time() - start_time)
         print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
