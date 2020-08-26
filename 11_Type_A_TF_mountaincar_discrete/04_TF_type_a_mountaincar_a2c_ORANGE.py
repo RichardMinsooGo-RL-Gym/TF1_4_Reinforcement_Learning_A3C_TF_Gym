@@ -31,25 +31,9 @@ if not os.path.exists(model_path):
 if not os.path.exists(graph_path):
     os.makedirs(graph_path)
     
-def train_model(agent, x, y, adv):
-    '''에피소드당 학습을 하기위한 함수
-    
-    Args:
-        agent(ActorCritic): 학습될 네트워크
-        x(np.array): State가 저장되어있는 array
-        y(np.array): Action(one_hot)이 저장되어있는 array
-        adv(np.array) : Discounted reward가 저장되어있는 array
-        
-    Returns:
-        l(float): 네트워크에 의한 loss
-    '''
-    l,_ = agent.sess.run([agent.loss, agent.train_op], feed_dict={agent.state: x, agent.action: y, agent.q_target : adv})
-    agent.episode_memory = []
-    return l
-
 # This is REINFORCE agent for the Cartpole
-class ActorCritic:
-    def __init__(self, sess, state_size, action_size):
+class A2C_agent(object):
+    def __init__(self, sess, scope):
         self.sess = sess
         # if you want to see Cartpole learning, then change to True
         self.render = False
@@ -71,55 +55,86 @@ class ActorCritic:
         self.hidden1, self.hidden2 = 64, 64
         
         self.ep_trial_step = 10000
-        # lists for the states, actions and rewards
-        self.episode_memory = []
-        
-        self.build_model()
+        self.scope = scope
 
-    def build_model(self):
+        # create model for actor and critic network
+        with tf.variable_scope(self.scope):
+            self._init_input()
+            self.build_model()
+            self._init_op()
+
+    def _init_input(self):
         # with tf.variable_scope('input'):
-        self.state = tf.placeholder(tf.float32, [None, self.state_size], name="states")
+        self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
         self.action = tf.placeholder(tf.float32, [None, self.action_size], name="action")
         self.q_target = tf.placeholder(tf.float32, name="q_target")
-            
-        w_init, b_init = tf.random_normal_initializer(mean=0, stddev=0.3), tf.constant_initializer(0.1)
-        # Actor network
-        actor_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
-            kernel_initializer = w_init, bias_initializer = b_init, name='fc1_a')
 
-        actor_predict = tf.layers.dense(inputs=actor_hidden, units = self.action_size, activation=None,
-            kernel_initializer = w_init, bias_initializer = b_init, name='fc2_a')
+    # neural network structure of the actor and critic
+    def build_model(self):
 
-        # Critic network
-        critic_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
-            kernel_initializer = w_init, bias_initializer = b_init, name='fc1_c')
-        
-        critic_predict = tf.layers.dense(inputs=critic_hidden, units = self.value_size, activation=None,
-            kernel_initializer = w_init, bias_initializer = b_init, name='fc2_c')
-        
-        self.policy = tf.nn.softmax(actor_predict, name='act_prob')  # use softmax to convert to probability
-        self.value = critic_predict
-        
-        # A_t = R_t - V(S_t)
-        self.td_error = self.q_target - self.value
-        
-        # Policy loss
-        self.log_p = self.action * tf.log(tf.clip_by_value(self.policy,1e-10,1.))
-        self.log_lik = self.log_p * tf.stop_gradient(self.td_error)
-        self.actor_loss = -tf.reduce_mean(tf.reduce_sum(self.log_lik, axis=1))
-        
-        # entropy(for more exploration)
-        self.entropy = -tf.reduce_mean(tf.reduce_sum(self.policy * tf.log(tf.clip_by_value(self.policy,1e-10,1.)), axis=1))
-        
-        # Value loss
-        self.critic_loss = tf.reduce_mean(tf.square(self.value - self.q_target), axis=1)
-        
-        # Total loss
-        self.loss = self.actor_loss + self.critic_loss - self.entropy * 0.01
-        
-        with tf.variable_scope('train'):
-            self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.loss)
+        w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(0.1)
+
+        with tf.variable_scope("model"):
+
+            actor_hidden = tf.layers.dense(self.state, self.hidden1, tf.nn.tanh, kernel_initializer=w_init,
+                                        bias_initializer=b_init)
+
+            self.actor_predict = tf.layers.dense(actor_hidden, self.action_size, kernel_initializer=w_init,
+                                                   bias_initializer=b_init)
+
+            self.policy = tf.nn.softmax(self.actor_predict)
+    
+        # with tf.variable_scope("critic"):
+            critic_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
+                kernel_initializer=w_init, bias_initializer=b_init, name='fc1_c')
+
+            critic_predict = tf.layers.dense(inputs=critic_hidden, units = self.value_size, activation=None,
+                kernel_initializer=w_init, bias_initializer=b_init, name='fc2_c')
+            self.value = critic_predict
             
+        self.model_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/model')
+        
+    # make loss function for Policy Gradient
+    # [log(action probability) * discounted_rewards] will be input for the back prop
+    # we add entropy of action probability to loss
+    def _init_op(self):
+        with tf.variable_scope("Training_op"):
+            
+            self.model_optimizer = tf.train.AdamOptimizer(self.learning_rate)
+
+            # with tf.variable_scope('td_error'):
+            # A_t = R_t - V(S_t)
+            # self.td_error = tf.subtract(self.q_target, self.value, name='td_error')
+            self.td_error = self.q_target - self.value
+
+            # with tf.variable_scope('actor_loss'):
+            # Policy loss
+            self.log_p = self.action * tf.log(tf.clip_by_value(self.policy,1e-10,1.))
+            self.log_lik = self.log_p * tf.stop_gradient(self.td_error)
+            self.actor_loss = -tf.reduce_mean(tf.reduce_sum(self.log_lik, axis=1))
+
+            # with tf.variable_scope('local_gradients'):
+            # entropy(for more exploration)
+            self.entropy = -tf.reduce_mean(tf.reduce_sum(self.policy * tf.log(tf.clip_by_value(self.policy,1e-10,1.)), axis=1))
+
+            # with tf.variable_scope('critic_loss'):
+            # Value loss
+            # self.critic_loss = tf.reduce_mean(tf.square(self.td_error))
+            self.critic_loss = tf.reduce_mean(tf.square(self.value - self.q_target), axis=1)
+
+            # Total loss
+            self.model_loss = self.actor_loss + self.critic_loss - self.entropy * 0.01
+
+            # with tf.name_scope('local_gradients'):
+            self.model_gradients = tf.gradients(self.model_loss, self.model_params) #calculate gradients for the network weights
+
+            # with tf.name_scope('sync'): # update local and global network weights
+            # with tf.name_scope('pull'): # it is only for A3C
+            
+            # with tf.name_scope('push'):
+            zipped_model_vars = zip(self.model_gradients, self.model_params)
+            self.update_model_op = self.model_optimizer.apply_gradients(zipped_model_vars)
+        
     # get action from policy network
     def get_action(self, state):
         # Reshape observation to (num_features, 1)
@@ -132,9 +147,10 @@ class ActorCritic:
         action = np.random.choice(np.arange(self.action_size), p=prob_weights[0])
 
         return action
-
+        
     # calculate discounted rewards
-    def discount_and_norm_rewards(self, buffer_reward):
+    def discount_and_norm_rewards(self):
+        buffer_reward = np.vstack(self.buffer_reward)
         discounted_rewards = np.zeros_like(buffer_reward)
         running_add = 0
         for index in reversed(range(0, len(buffer_reward))):
@@ -145,16 +161,31 @@ class ActorCritic:
         discounted_rewards -= np.mean(discounted_rewards)
         discounted_rewards /= np.std(discounted_rewards)
         return discounted_rewards
-    
-    # save <s, a ,r> of each step
-    # this is used for calculating discounted rewards
+
     def append_sample(self, state, action, reward):
         # Store actions as list of arrays
         # e.g. for action_size = 2 -> [ array([ 1.,  0.]), array([ 0.,  1.]), array([ 0.,  1.]), array([ 1.,  0.]) ]
         action_array = np.zeros(self.action_size)
         action_array[action] = 1
-        self.episode_memory.append([state, action_array, reward])
         
+        self.buffer_state.append(state)
+        self.buffer_action.append(action_array)        
+        self.buffer_reward.append(reward)
+
+    # update policy network and value network every episode
+    def train_model(self):
+        discounted_rewards = self.discount_and_norm_rewards()
+                    
+        feed_dict={
+            self.state: np.vstack(self.buffer_state),
+            self.action: np.vstack(self.buffer_action),
+            self.q_target: discounted_rewards,
+        }
+        
+        model_loss,_ = self.sess.run([self.model_loss, self.update_model_op], feed_dict)
+        
+        self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
+
     def save_model(self):
         # Save the variables to disk.
         save_path = self.saver.save(self.sess, model_path + "/model.ckpt")
@@ -167,7 +198,7 @@ class ActorCritic:
 def main():
     with tf.Session() as sess:
         # sess = tf.Session()
-        agent = ActorCritic(sess, state_size, action_size)
+        agent = A2C_agent(sess, "model")
 
         init = tf.global_variables_initializer()
         agent.saver = tf.train.Saver()
@@ -189,14 +220,15 @@ def main():
         avg_score = 10000
         episodes, scores = [], []
 
+        agent.buffer_state, agent.buffer_action, agent.buffer_reward = [], [], []
         # start training    
         # Step 3.2: run the game
         display_time = datetime.datetime.now()
         print("\n\n",game_name, "-game start at :",display_time,"\n")
         start_time = time.time()
-
+        
         while time.time() - start_time < agent.training_time and avg_score > 200:
-
+            
             state = env.reset()
             done = False
             score = 10000
@@ -222,14 +254,7 @@ def main():
 
                 if done or ep_step == agent.ep_trial_step:
                     agent.episode += 1
-                    # env.reset()
-                    agent.episode_memory = np.array(agent.episode_memory)
-                    buffer_reward = np.vstack(agent.episode_memory[:, 2])
-
-                    discounted_rewards = agent.discount_and_norm_rewards(buffer_reward)
-
-                    l = train_model(agent, np.vstack(agent.episode_memory[:,0]), np.vstack(agent.episode_memory[:,1]),
-                                       discounted_rewards)
+                    agent.train_model()
 
                     # every episode, plot the play time
                     scores.append(score)
@@ -244,7 +269,7 @@ def main():
         agent.save_model()
 
         pylab.plot(episodes, scores, 'b')
-        pylab.savefig("./save_graph/Cartpole_A2C_2.png")
+        pylab.savefig("./save_graph/mountaincar_A2C_4.png")
         e = int(time.time() - start_time)
         print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
         sys.exit()

@@ -50,8 +50,8 @@ if not os.path.exists(graph_path):
 
 # Network for the Actor Critic
 class A3CAgent(object):
-    def __init__(self, scope, master_agent = None):
-        
+    def __init__(self, sess, scope, master_agent = None):
+        self.sess = sess
         # if you want to see Cartpole learning, then change to True
         self.render = False
         # get size of state and action
@@ -64,22 +64,53 @@ class A3CAgent(object):
         
         self.master_agent = master_agent
         self.scope = scope
-        
-        if scope == "master":   # get global network
-            with tf.variable_scope(scope):
-                self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
-                # parameters of actor and critic net
-                # self.model_params, self.critic_params = self.build_model(scope)[-1:]
-                self.policy, self.value, self.model_params = self.build_model(scope)
-                                
+
+        # create model for actor and critic network
+        with tf.variable_scope(self.scope):
+            self._init_input()
+            self.build_model()
+            self._init_op()
+
+    def _init_input(self):
+        # with tf.variable_scope('input'):
+        self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
+        self.action = tf.placeholder(tf.float32, [None, self.action_size], name="action")
+        self.q_target = tf.placeholder(tf.float32, name="q_target")
+
+    # neural network structure of the actor and critic
+    def build_model(self):
+
+        w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(0.1)
+
+        with tf.variable_scope("model"):
+
+            actor_hidden = tf.layers.dense(self.state, self.hidden1, tf.nn.tanh, kernel_initializer=w_init,
+                                        bias_initializer=b_init)
+
+            self.actor_predict = tf.layers.dense(actor_hidden, self.action_size, kernel_initializer=w_init,
+                                                   bias_initializer=b_init)
+
+            self.policy = tf.nn.softmax(self.actor_predict)
+    
+        # with tf.variable_scope("critic"):
+            critic_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
+                kernel_initializer=w_init, bias_initializer=b_init, name='fc1_c')
+
+            critic_predict = tf.layers.dense(inputs=critic_hidden, units = self.value_size, activation=None,
+                kernel_initializer=w_init, bias_initializer=b_init, name='fc2_c')
+            self.value = critic_predict
+            
+        self.model_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/model')
+
+    # make loss function for Policy Gradient
+    # [log(action probability) * discounted_rewards] will be input for the back prop
+    # we add entropy of action probability to loss
+    def _init_op(self):
+        if self.scope == 'master':   # get global network
+            with tf.name_scope(self.scope):
+                self.model_optimizer = tf.train.AdamOptimizer(learning_rate)
         else:   # local net, calculate losses
             with tf.variable_scope(self.scope):
-                self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
-                self.action = tf.placeholder(tf.float32, [None, self.action_size], name="action")
-                self.q_target = tf.placeholder(tf.float32, [None, 1],          name='q_target')
-
-                self.policy, self.value, self.model_params = self.build_model(scope)
-                
                 # with tf.variable_scope('td_error'):
                 # A_t = R_t - V(S_t)
                 # self.td_error = tf.subtract(self.q_target, self.value, name='td_error')
@@ -113,47 +144,21 @@ class A3CAgent(object):
 
             # with tf.name_scope('push'):
             zipped_model_vars = zip(self.model_gradients, self.master_agent.model_params)
-            self.update_model_op = OPT_A.apply_gradients(zipped_model_vars)
-
-    # neural network structure of the actor and critic
-    def build_model(self, scope):
-
-        w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(0.1)
-
-        with tf.variable_scope("model"):
-
-            actor_hidden = tf.layers.dense(self.state, self.hidden1, tf.nn.tanh, kernel_initializer=w_init,
-                                        bias_initializer=b_init)
-
-            self.actor_predict = tf.layers.dense(actor_hidden, self.action_size, kernel_initializer=w_init,
-                                                   bias_initializer=b_init)
-
-            self.policy = tf.nn.softmax(self.actor_predict)
-    
-        # with tf.variable_scope("critic"):
-            critic_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
-                kernel_initializer=w_init, bias_initializer=b_init, name='fc1_c')
-
-            critic_predict = tf.layers.dense(inputs=critic_hidden, units = self.value_size, activation=None,
-                kernel_initializer=w_init, bias_initializer=b_init, name='fc2_c')
-            self.value = critic_predict
-            
-        self.model_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/model')
-        
-        return self.policy, self.value, self.model_params # , self.critic_params
+            self.update_model_op = self.master_agent.model_optimizer.apply_gradients(zipped_model_vars)
 
     def update_global(self, feed_dict):  # run by a local
-        sess.run(self.update_model_op, feed_dict)  # local grads applies to global net
+        self.sess.run(self.update_model_op, feed_dict)
 
     def pull_global(self):  # run by a local
-        sess.run(self.pull_model_params_op)
+        self.sess.run(self.pull_model_params_op)
 
     # get action from policy network
     def get_action(self, state):
         # Reshape observation to (num_features, 1)
         state_t = np.reshape(state, [1, self.state_size])
         # Run forward propagation to get softmax probabilities
-        prob_weights = sess.run(self.policy, feed_dict={self.state: state_t})
+        prob_weights = self.sess.run(self.policy, feed_dict={self.state: state_t})
+
         # Select action using a biased sample
         # this will return the index of the action we've sampled
         action = np.random.choice(np.arange(self.action_size), p=prob_weights[0])
@@ -162,11 +167,13 @@ class A3CAgent(object):
         
 # worker class that inits own environment, trains on it and updloads weights to global net
 class Worker(object):
-    def __init__(self, env, name, COORD, master_agent):
+    def __init__(self, env, sess, name, COORD, master_agent):
+
+        self.sess = sess
         self.env = env
         self.coordinator = COORD
         self.name = name
-        self.agent = A3CAgent(name, master_agent)
+        self.agent = A3CAgent(sess, name, master_agent)
         self.master_agent = master_agent
 
         self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
@@ -275,8 +282,7 @@ class Worker(object):
 if __name__ == "__main__":
     sess = tf.Session()
 
-    OPT_A = tf.train.AdamOptimizer(learning_rate, name='AdamOptimizer')
-    global_agent = A3CAgent("master")  # we only need its params
+    global_agent = A3CAgent(sess, "master")  # we only need its params
     workers = []
     
     COORD = tf.train.Coordinator()
@@ -285,7 +291,7 @@ if __name__ == "__main__":
     for index in range(N_WORKERS):
         env = gym.make(env_name).unwrapped
         i_name = 'W_%i' % index   # worker name
-        workers.append(Worker(env, i_name, COORD, global_agent))
+        workers.append(Worker(env, sess, i_name, COORD, global_agent))
 
     sess.run(tf.global_variables_initializer())
     

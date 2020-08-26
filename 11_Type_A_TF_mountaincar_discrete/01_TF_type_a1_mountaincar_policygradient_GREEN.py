@@ -1,10 +1,14 @@
-import os
-import sys
 import gym
-import pylab
-import numpy as np
-import time
 import tensorflow as tf
+import numpy as np
+import time, datetime
+import pylab
+import sys
+import pickle
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+from tensorflow.python.framework import ops
+ops.reset_default_graph()
 
 env_name = 'MountainCar-v0'
 # set environment
@@ -16,16 +20,16 @@ env = env.unwrapped
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 
-MAX_EP_STEP = 15000
-UPDATE_GLOBAL_ITER = 10
-model_path = os.path.join(os.getcwd(), 'save_model')
-graph_path = os.path.join(os.getcwd(), 'save_graph')
+game_name =  sys.argv[0][:-3]
 
-if not os.path.isdir(model_path):
-    os.mkdir(model_path)
+model_path = "save_model/" + game_name
+graph_path = "save_graph/" + game_name
 
-if not os.path.isdir(graph_path):
-    os.mkdir(graph_path)
+# Make folder for save data
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+if not os.path.exists(graph_path):
+    os.makedirs(graph_path)
     
 def train_model(agent, x, y, reward):
     '''에피소드당 학습을 하기위한 함수
@@ -49,22 +53,31 @@ class PolicyGradient:
         self.sess = sess
         # if you want to see Cartpole learning, then change to True
         self.render = False
-        self.load_model = False
-        
         # get size of state and action
-        self.action_size = action_size
         self.state_size = state_size
+        self.action_size = action_size
+        
+        # train time define
+        self.training_time = 40*60
+        
         # these is hyper parameters for the PolicyGradient
-        self.discount_factor = 0.99         # decay rate
-        self.learning_rate = 0.005
-        self.hidden1, self.hidden2 = 128, 128
+        self.learning_rate = 0.001
+        self.discount_factor = 0.99
+        
+        self.step = 0
+        self.episode = 0
+        
+        self.hidden1, self.hidden2 = 64, 64
+        
+        self.ep_trial_step = 10000
+        # lists for the states, actions and rewards
         self.episode_memory = []
         
         self.build_model()
 
     def build_model(self):
         # with tf.variable_scope('input'):
-        self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
+        self.state = tf.placeholder(tf.float32, [None, self.state_size], name="states")
         self.action = tf.placeholder(tf.float32, [None, self.action_size], name="action")
         self.reward = tf.placeholder(tf.float32, name="reward")
         
@@ -87,18 +100,11 @@ class PolicyGradient:
                     
     # get action from policy network
     def get_action(self, state):
-        """
-            Choose action based on observation
-
-            Arguments:
-                state: array of state, has shape (num_features)
-
-            Returns: index of action we want to choose
-        """
         # Reshape observation to (num_features, 1)
         state_t = np.reshape(state, [1, self.state_size])
         # Run forward propagation to get softmax probabilities
         prob_weights = self.sess.run(self.policy, feed_dict={self.state: state_t})
+
         # Select action using a biased sample
         # this will return the index of the action we've sampled
         action = np.random.choice(np.arange(self.action_size), p=prob_weights[0])
@@ -123,54 +129,77 @@ class PolicyGradient:
     def append_sample(self, state, action, reward):
         # Store actions as list of arrays
         # e.g. for action_size = 2 -> [ array([ 1.,  0.]), array([ 0.,  1.]), array([ 0.,  1.]), array([ 1.,  0.]) ]
-        act = np.zeros(self.action_size)
-        act[action] = 1
-        self.episode_memory.append([state, act, reward])
-    
+        action_array = np.zeros(self.action_size)
+        action_array[action] = 1
+        self.episode_memory.append([state, action_array, reward])
+        
+    def save_model(self):
+        # Save the variables to disk.
+        save_path = self.saver.save(self.sess, model_path + "/model.ckpt")
+        save_object = (self.episode, self.step)
+        with open(model_path + '/epsilon_episode.pickle', 'wb') as ggg:
+            pickle.dump(save_object, ggg)
+
+        print("\n Model saved in file: %s" % model_path)
+
 def main():
     with tf.Session() as sess:
+        # sess = tf.Session()
         agent = PolicyGradient(sess, state_size, action_size)
 
-        agent.sess.run(tf.global_variables_initializer())
-        train_steps = 0
-        scores, episodes = [], []
-        episode = 0
-        avg_score = MAX_EP_STEP
+        init = tf.global_variables_initializer()
+        agent.saver = tf.train.Saver()
+        ckpt = tf.train.get_checkpoint_state(model_path)
 
+        if ckpt and tf.train.checkpoint_exists(ckpt.model_checkpoint_path):
+            agent.saver.restore(agent.sess, ckpt.model_checkpoint_path)
+            if os.path.isfile(model_path + '/epsilon_episode.pickle'):
+
+                with open(model_path + '/epsilon_episode.pickle', 'rb') as ggg:
+                    agent.episode, agent.step = pickle.load(ggg)
+
+            print('\n\n Variables are restored!')
+
+        else:
+            agent.sess.run(init)
+            print('\n\n Variables are initialized!')
+
+        avg_score = 10000
+        episodes, scores = [], []
+
+        # start training    
+        # Step 3.2: run the game
+        display_time = datetime.datetime.now()
+        print("\n\n",game_name, "-game start at :",display_time,"\n")
         start_time = time.time()
         
-        while time.time() - start_time < 20*60 and avg_score > 200:
+        while time.time() - start_time < agent.training_time and avg_score > 200:
             
-            done = False
-            score = 0
             state = env.reset()
+            done = False
+            score = 10000
+            ep_step = 0
 
-            while not done and score < MAX_EP_STEP:
-                # every time step we do train from the replay memory
-                score += 1
-                
+            while not done and ep_step < agent.ep_trial_step:
                 # fresh env
-                # if agent.render:
-                #     env.render()
-                train_steps += 1
-                # get action for the current state and go one step in environment
+                ep_step += 1
+                agent.step += 1
+
+                # Select action_arr
                 action = agent.get_action(state)
-                
-                # make step in environment
+
+                # run the selected action_arr and observe next state and reward
                 next_state, reward, done, _ = env.step(action) 
-                
+
                 # save the sample <state, action, reward> to the memory
                 agent.append_sample(state, action, reward)
-                
-                # if train_steps % 10 == 0 or done:   # update global and assign to local net
-                #     agent.train_model()
-                    
-                # swap observation
+
+                score = ep_step
+
                 state = next_state
-                
-                # train when epsisode finished
-                if done or score == MAX_EP_STEP:
-                    episode += 1
+
+                if done or ep_step == agent.ep_trial_step:
+                    agent.episode += 1
                     # env.reset()
                     agent.episode_memory = np.array(agent.episode_memory)
                     buffer_reward = np.vstack(agent.episode_memory[:, 2])
@@ -179,20 +208,24 @@ def main():
                     
                     l = train_model(agent, np.vstack(agent.episode_memory[:,0]), np.vstack(agent.episode_memory[:,1]),
                                        discounted_rewards)
-                    
+
                     # every episode, plot the play time
                     scores.append(score)
-                    episodes.append(episode)
+                    episodes.append(agent.episode)
                     avg_score = np.mean(scores[-min(30, len(scores)):])
-                    
-                    print("episode :{:5d}".format(episode), "/ score :{:5d}".format(score))
-                    
+
+                    print('episode :{:>6,d}'.format(agent.episode),'/ ep step :{:>5,d}'.format(ep_step), \
+                          '/ time step :{:>8,d}'.format(agent.step),'/ last 30 avg :{:> 4.1f}'.format(avg_score) )
+
                     break
+        # Save model
+        agent.save_model()
 
         pylab.plot(episodes, scores, 'b')
-        pylab.savefig("./save_graph/Cartpole_PG_TF.png")
+        pylab.savefig("./save_graph/mountaincar_PG_1.png")
+
         e = int(time.time() - start_time)
-        print('Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
+        print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
         sys.exit()
 
 if __name__ == "__main__":
