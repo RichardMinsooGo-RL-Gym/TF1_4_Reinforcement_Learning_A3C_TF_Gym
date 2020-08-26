@@ -31,8 +31,8 @@ if not os.path.exists(model_path):
 if not os.path.exists(graph_path):
     os.makedirs(graph_path)
     
-# Network for the Actor Critic
-class A2C_agent(object):
+# This is REINFORCE agent for the Cartpole
+class PolicyGradient:
     def __init__(self, sess, scope):
         self.sess = sess
         # if you want to see Cartpole learning, then change to True
@@ -40,7 +40,6 @@ class A2C_agent(object):
         # get size of state and action
         self.state_size = state_size
         self.action_size = action_size
-        self.value_size = 1
         
         # train time define
         self.training_time = 40*60
@@ -56,7 +55,10 @@ class A2C_agent(object):
         
         self.ep_trial_step = 10000
         self.scope = scope
-
+        
+        # lists for the states, actions and rewards
+        self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
+        
         # create model for actor and critic network
         with tf.variable_scope(self.scope):
             self._init_input()
@@ -67,15 +69,14 @@ class A2C_agent(object):
         # with tf.variable_scope('input'):
         self.state = tf.placeholder(tf.float32,  [None, self.state_size], name='state')
         self.action = tf.placeholder(tf.int32,   [None, ],               name='action')
-        self.q_target = tf.placeholder(tf.float32, name="q_target")
+        self.reward = tf.placeholder(tf.float32, name="reward")
 
-    # approximate policy and value using Neural Network
-    # actor -> state is input and probability of each action is output of network
+    # neural network structure of the actor and critic
     def build_model(self):
 
         w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(0.1)
 
-        with tf.variable_scope("actor"):
+        with tf.variable_scope("model"):
 
             actor_hidden = tf.layers.dense(self.state, self.hidden1, tf.nn.tanh, kernel_initializer=w_init,
                                         bias_initializer=b_init)
@@ -84,41 +85,25 @@ class A2C_agent(object):
                                                    bias_initializer=b_init)
 
             self.policy = tf.nn.softmax(self.actor_predict)
-            
-        with tf.variable_scope("critic"):
-            
-            critic_hidden = tf.layers.dense(inputs=self.state, units = self.hidden1, activation=tf.nn.tanh,  # tanh activation
-                kernel_initializer=w_init, bias_initializer=b_init, name='fc1_c')
 
-            critic_predict = tf.layers.dense(inputs=critic_hidden, units = self.value_size, activation=None,
-                kernel_initializer=w_init, bias_initializer=b_init, name='fc2_c')
-            self.value = critic_predict
-            
+        self.model_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/model')
+        
     def _init_op(self):
-        
-        # with tf.variable_scope('td_error'):
-        # A_t = R_t - V(S_t)
-        # self.td_error = tf.subtract(self.q_target, self.value, name='td_error')
-        self.td_error = self.q_target - self.value
-        
-        # with tf.variable_scope('critic_loss'):
-        # Value loss
-        # self.critic_loss = tf.reduce_mean(tf.square(self.td_error))
-        self.critic_loss = tf.reduce_mean(tf.square(self.value - self.q_target), axis=1)
-
         # with tf.variable_scope('actor_loss'):
-        log_prob = tf.reduce_sum(tf.log(self.policy + 1e-5) * tf.one_hot(self.action, self.action_size, dtype=tf.float32), axis=1, keep_dims=True)
-        exp_v = log_prob * tf.stop_gradient(self.td_error)
-        entropy = -tf.reduce_sum(self.policy * tf.log(self.policy + 1e-5),
-                                 axis=1, keep_dims=True)  # encourage exploration
-        self.exp_v = 0.001 * entropy + exp_v
-        self.actor_loss = tf.reduce_mean(-self.exp_v)
+        action_one_hot = tf.one_hot(self.action, self.action_size, dtype=tf.float32)
+        entropy = -tf.reduce_sum(tf.log(self.policy) * action_one_hot, axis=1)
+        self.actor_loss = tf.reduce_mean(entropy * self.reward)
         
-        self.loss_total = self.actor_loss + self.critic_loss
-
         # with tf.variable_scope('train'):
-        self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.loss_total)
+        # self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.actor_loss)
         
+        # with tf.variable_scope('train'):
+        self.model_gradients = tf.gradients(self.actor_loss, self.model_params) #calculate gradients for the network weights
+        self.model_optimizer = tf.train.AdamOptimizer(self.learning_rate)
+        
+        zipped_model_vars = zip(self.model_gradients, self.model_params)
+        self.update_model_op = self.model_optimizer.apply_gradients(zipped_model_vars)        
+            
     # get action from policy network
     def get_action(self, state):
         # Reshape observation to (num_features, 1)
@@ -130,6 +115,21 @@ class A2C_agent(object):
         action = np.random.choice(range(prob_weights.shape[1]), p=prob_weights.ravel())
         return action
         
+        
+    # calculate discounted rewards
+    def discount_and_norm_rewards(self):
+        buffer_reward = self.buffer_reward
+        discounted_rewards = np.zeros_like(buffer_reward)
+        running_add = 0
+        for index in reversed(range(0, len(buffer_reward))):
+            running_add = running_add * self.discount_factor + buffer_reward[index]
+            discounted_rewards[index] = running_add
+            
+        # normalize episode rewards
+        discounted_rewards -= np.mean(discounted_rewards)
+        discounted_rewards /= np.std(discounted_rewards)
+        return discounted_rewards
+    
     # save <s, a ,r> of each step
     # this is used for calculating discounted rewards
     def append_sample(self, state, action, reward):
@@ -138,28 +138,18 @@ class A2C_agent(object):
         self.buffer_reward.append(reward)
 
     # update policy network and value network every episode
-    def train_model(self, next_state, done):
-        if done:
-            value_next_state = 0   # terminal
-        else:
-            value_next_state = self.sess.run(self.value, {self.state: next_state[np.newaxis, :]})[0][0]
-
-        for reward in self.buffer_reward[::-1]:    # reverse buffer r
-            value_next_state = reward + self.discount_factor * value_next_state
-            self.buffer_q_target.append(value_next_state)
-
-        self.buffer_q_target.reverse()
-
+    def train_model(self):
+        discounted_rewards = self.discount_and_norm_rewards()
+                    
         feed_dict={
             self.state: np.vstack(self.buffer_state),
             self.action: np.array(self.buffer_action),
-            self.q_target: np.vstack(self.buffer_q_target)
-        } 
+            self.reward: discounted_rewards,
+        }
         
-        self.sess.run(self.train_op, feed_dict)
+        actor_loss,_ = self.sess.run([self.actor_loss, self.update_model_op], feed_dict)
         
         self.buffer_state, self.buffer_action, self.buffer_reward = [], [], []
-        self.buffer_q_target = []
 
     def save_model(self):
         # Save the variables to disk.
@@ -172,7 +162,7 @@ class A2C_agent(object):
 
 def main():
     with tf.Session() as sess:
-        agent = A2C_agent(sess, "model")
+        agent = PolicyGradient(sess, "model")
 
         init = tf.global_variables_initializer()
         agent.saver = tf.train.Saver()
@@ -191,9 +181,6 @@ def main():
             agent.sess.run(init)
             print('\n\n Variables are initialized!')
 
-        agent.buffer_state, agent.buffer_action, agent.buffer_reward = [], [], []
-        agent.buffer_q_target = []
-        
         avg_score = 10000
         episodes, scores = [], []
 
@@ -223,20 +210,15 @@ def main():
                 
                 # save the sample <state, action, reward> to the memory
                 agent.append_sample(state, action, reward)
-                
-                if agent.step % 10 == 0 or done:   # update global and assign to local net
-                    agent.train_model(next_state, done)
-                    
+
                 score = ep_step
 
-                # swap observation
                 state = next_state
 
                 if done or ep_step == agent.ep_trial_step:
                     agent.episode += 1
-                    # agent.train_model(next_state, done)
-                    
-                    # every episode, plot the play time
+                    agent.train_model()
+
                     scores.append(score)
                     episodes.append(agent.episode)
                     avg_score = np.mean(scores[-min(30, len(scores)):])
@@ -249,7 +231,7 @@ def main():
         agent.save_model()
 
         pylab.plot(episodes, scores, 'b')
-        pylab.savefig("./save_graph/mountaincar_A2C_1.png")
+        pylab.savefig("./save_graph/mountaincar_PG_2.png")
 
         e = int(time.time() - start_time)
         print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))

@@ -107,15 +107,13 @@ class A2C_agent(object):
         self.critic_loss = tf.reduce_mean(tf.square(self.value - self.q_target), axis=1)
 
         # with tf.variable_scope('actor_loss'):
-        log_prob = tf.reduce_sum(tf.log(self.policy + 1e-5) * tf.one_hot(self.action, self.action_size, dtype=tf.float32), axis=1, keep_dims=True)
-        exp_v = log_prob * tf.stop_gradient(self.td_error)
-        entropy = -tf.reduce_sum(self.policy * tf.log(self.policy + 1e-5),
-                                 axis=1, keep_dims=True)  # encourage exploration
-        self.exp_v = 0.001 * entropy + exp_v
-        self.actor_loss = tf.reduce_mean(-self.exp_v)
+        action_one_hot = tf.one_hot(self.action, self.action_size, dtype=tf.float32)
+        entropy = -tf.reduce_sum(tf.log(self.policy) * action_one_hot, axis=1, keep_dims=True)
+        
+        self.actor_loss = tf.reduce_mean(entropy * tf.stop_gradient(self.td_error))
         
         self.loss_total = self.actor_loss + self.critic_loss
-
+        
         # with tf.variable_scope('train'):
         self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.loss_total)
         
@@ -249,7 +247,7 @@ def main():
         agent.save_model()
 
         pylab.plot(episodes, scores, 'b')
-        pylab.savefig("./save_graph/mountaincar_A2C_1.png")
+        pylab.savefig("./save_graph/mountaincar_A2C_4.png")
 
         e = int(time.time() - start_time)
         print(' Elasped time :{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60))
